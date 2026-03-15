@@ -1,0 +1,359 @@
+"""
+Sentinel v5.0  —  predict.py
+AI-Powered Behavioral Analysis Endpoint
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+
+import requests as req_lib
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dataclasses import asdict
+
+# Import behavioral engine from zip_scanner
+from backend_ml.inference.zip_scanner import (
+    BehaviorVector,
+    Chain,
+    extract_features,
+    detect_chains,
+    heuristic_verdict,
+    build_findings,
+    extract_files_from_upload,
+    scan_zip_safely,
+    OLLAMA_URL,
+    OLLAMA_MODEL,
+    OLLAMA_TIMEOUT,
+    MAX_ZIP_BYTES,
+)
+
+# --- logging ------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("sentinel.predict")
+
+# --- FastAPI ------------------------------------------------------------------
+app = FastAPI(title="Sentinel v5.0 Behavioral Engine")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# =============================================================================
+#  PYDANTIC RESPONSE MODELS
+# =============================================================================
+
+class FileResult(BaseModel):
+    filename:           str
+    behavioral_intent:  str
+    final_verdict:      str
+    risk_score:         float
+    extracted_features: dict
+    action_chains:      list[str]
+    findings:           list[str]
+
+
+class PredictResponse(BaseModel):
+    archive_verdict:    str
+    archive_risk_score: float
+    behavioral_summary: str
+    file_results:       list[FileResult]
+
+
+# =============================================================================
+#  STAGE 4 — OLLAMA BRIDGE (AI Analysis)
+# =============================================================================
+
+_SYSTEM_PROMPT = """You are a Security Sandbox Analyst inside the Sentinel v5.0 engine.
+
+You receive a Behavioral Feature Map extracted from source code.
+The Feature Map lists detected ACTION PRIMITIVES and pre-computed ACTION CHAINS.
+
+YOUR TASK:
+Analyze the action sequence. Determine the true behavioral intent.
+
+JUDGMENT RULES — apply these strictly:
+  - Judge the ACTIONS, not the filename, folder name, or project name.
+  - "Researcher Analysis Chain" (Reading + Hashing + Logging, no network send)
+    -> label SAFE or BENIGN_RESEARCH_TOOL
+  - "Attack Chain" (Exfiltration, Reverse Shell, Credential Theft, Persistence)
+    -> label MALICIOUS, regardless of what folder the file is in
+  - Risky primitives present but no complete attack chain
+    -> label SUSPICIOUS
+  - No risky primitives at all
+    -> label SAFE
+
+Respond with ONLY this JSON — no prose, no markdown fences, no extra keys:
+{
+  "behavioral_intent":  "<2-5 word label>",
+  "final_verdict":      "<SAFE | BENIGN_RESEARCH_TOOL | SUSPICIOUS | MALICIOUS>",
+  "risk_score":         <integer 0 to 10>,
+  "executive_summary":  "<2-4 sentences: what this code does and why you chose this verdict>"
+}"""
+
+
+def _build_ollama_prompt(vec: BehaviorVector, chains: list[Chain]) -> str:
+    dims = [
+        ("network_io",            vec.has_network_io),
+        ("file_manipulation",     vec.has_file_manipulation),
+        ("exec_primitive",        vec.has_exec_primitive),
+        ("persistence_logic",     vec.has_persistence_logic),
+        ("encoding_obfuscation",  vec.has_encoding_obfuscation),
+        ("credential_access",     vec.has_credential_access),
+        ("c2_indicator",          vec.has_c2_indicator),
+        ("hashing_only",          vec.has_hashing),
+        ("ml_library",            vec.has_ml_library),
+        ("test_framework",        vec.has_test_framework),
+        ("logging_only",          vec.has_logging_only),
+    ]
+    feature_lines = "\n".join(
+        f"  {name:<28}: {'YES' if active else 'no'}"
+        + (
+            "  |  evidence: " + " | ".join(vec.evidence.get("has_" + name, [])[:1])
+            if active and vec.evidence.get("has_" + name)
+            else ""
+        )
+        for name, active in dims
+    )
+    if chains:
+        chain_lines = "\n".join(
+            f"  [{c.verdict}] {c.name}\n  -> {c.description}"
+            for c in chains
+        )
+    else:
+        chain_lines = "  (no action chains matched)"
+
+    return (
+        f"BEHAVIORAL FEATURE MAP:\n{feature_lines}\n\n"
+        f"DETECTED ACTION CHAINS:\n{chain_lines}\n\n"
+        "Analyze the action sequence above and return your verdict as JSON."
+    )
+
+
+def call_ollama(vec: BehaviorVector, chains: list[Chain]) -> dict | None:
+    """Send Feature Map to Ollama and get AI verdict."""
+    user_prompt = _build_ollama_prompt(vec, chains)
+    payload = {
+        "model":   OLLAMA_MODEL,
+        "system":  _SYSTEM_PROMPT,
+        "prompt":  user_prompt,
+        "stream":  False,
+        "options": {"temperature": 0.1, "num_predict": 400},
+    }
+    log.info("  -> Sending feature map to Ollama (%s)", OLLAMA_MODEL)
+    try:
+        resp = req_lib.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT)
+        resp.raise_for_status()
+    except req_lib.exceptions.ConnectionError:
+        log.warning("  x Ollama unreachable — heuristic fallback active")
+        return None
+    except req_lib.exceptions.Timeout:
+        log.warning("  x Ollama timed out — heuristic fallback active")
+        return None
+    except req_lib.exceptions.HTTPError as exc:
+        log.warning("  x Ollama HTTP error: %s — heuristic fallback active", exc)
+        return None
+
+    raw = resp.json().get("response", "").strip()
+    log.debug("  Ollama raw: %s", raw[:300])
+
+    # Clean JSON from markdown if present
+    clean = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
+    clean = re.sub(r"\n?```$",        "", clean, flags=re.MULTILINE).strip()
+    m = re.search(r"\{.*\}", clean, re.DOTALL)
+    if not m:
+        log.warning("  x No JSON in Ollama response")
+        return None
+    try:
+        parsed = json.loads(m.group())
+    except json.JSONDecodeError:
+        log.warning("  x JSON parse error")
+        return None
+
+    # Validate required keys
+    required_keys = {"behavioral_intent", "final_verdict", "risk_score", "executive_summary"}
+    if not required_keys <= parsed.keys():
+        log.warning("  x Ollama response missing required keys")
+        return None
+
+    # Normalize verdict
+    parsed["final_verdict"] = str(parsed["final_verdict"]).upper().strip()
+    if parsed["final_verdict"] not in {"SAFE", "BENIGN_RESEARCH_TOOL", "SUSPICIOUS", "MALICIOUS"}:
+        parsed["final_verdict"] = "SUSPICIOUS"
+    
+    # Validate and clamp risk score
+    try:
+        parsed["risk_score"] = max(0.0, min(10.0, float(parsed["risk_score"])))
+    except (ValueError, TypeError):
+        parsed["risk_score"] = 5.0
+
+    log.info("  + Ollama: %s  score=%.1f  intent=%s",
+             parsed["final_verdict"], parsed["risk_score"], parsed["behavioral_intent"])
+    return parsed
+
+
+# =============================================================================
+#  PER-FILE ANALYSIS
+# =============================================================================
+
+def analyse_file(member_filename: str, content: str) -> FileResult:
+    """Analyze a single file and return results with behavioral verdict."""
+    log.info("Analysing: %s", member_filename)
+    
+    # Use zip_scanner for feature extraction - NOW WITH FILEPATH for research detection
+    vec = extract_features(content, member_filename)
+    chains = detect_chains(vec)
+    
+    # Use predict.py for AI bridge (Ollama)
+    ai = call_ollama(vec, chains)
+    source = "ollama" if ai else "heuristic"
+    
+    # Fallback to heuristic if Ollama unavailable
+    if not ai:
+        ai = heuristic_verdict(vec, chains)
+    
+    # ==== CRITICAL: FORCE STRUCTURAL TRUST OVERRIDE ====
+    # If is_research_path is True and no network activity, force SAFE
+    if vec.is_research_path and not vec.has_network_io:
+        ai["final_verdict"] = "SAFE"
+        ai["risk_score"] = 0.0
+        ai["behavioral_intent"] = "Research Component"
+        ai["executive_summary"] = "Research/training path detected with no network activity - safe analytical component"
+        log.info("  => STRUCTURAL TRUST OVERRIDE: Research path = SAFE")
+    
+    # ==== CRITICAL: FORCE RISK SCORE TO 0.0 FOR SAFE VERDICTS ====
+    if ai["final_verdict"] == "SAFE" or ai["final_verdict"] == "BENIGN_RESEARCH_TOOL":
+        ai["risk_score"] = 0.0
+        log.info("  => SAFE VERDICT: Forcing risk_score to 0.0")
+    
+    # Build findings report
+    findings = build_findings(vec, chains, source)
+    
+    # Extract features as dict (excluding evidence for response size)
+    features_dict = {
+        k: v for k, v in asdict(vec).items()
+        if k != "evidence" and isinstance(v, bool)
+    }
+    
+    return FileResult(
+        filename          = member_filename,
+        behavioral_intent = ai["behavioral_intent"],
+        final_verdict     = ai["final_verdict"],
+        risk_score        = round(ai["risk_score"], 1),
+        extracted_features= features_dict,
+        action_chains     = [c.name for c in chains],
+        findings          = findings,
+    )
+
+
+# =============================================================================
+#  ARCHIVE SUMMARY
+# =============================================================================
+
+_VERDICT_RANK = {"MALICIOUS": 4, "SUSPICIOUS": 3, "BENIGN_RESEARCH_TOOL": 2, "SAFE": 1}
+
+
+def summarise_archive(file_results: list[FileResult]) -> tuple[str, float, str]:
+    """Generate archive-level verdict and summary."""
+    if not file_results:
+        return "SAFE", 0.0, "No analysable files found."
+
+    worst           = max(file_results, key=lambda r: _VERDICT_RANK.get(r.final_verdict, 0))
+    archive_verdict = worst.final_verdict
+    archive_score   = round(max(r.risk_score for r in file_results), 1)
+
+    counts: dict[str, int] = {}
+    for r in file_results:
+        counts[r.final_verdict] = counts.get(r.final_verdict, 0) + 1
+
+    parts = [
+        f"Archive contains {len(file_results)} analysable file(s).",
+        f"Verdicts: "
+        f"{counts.get('MALICIOUS', 0)} MALICIOUS, "
+        f"{counts.get('SUSPICIOUS', 0)} SUSPICIOUS, "
+        f"{counts.get('BENIGN_RESEARCH_TOOL', 0)} BENIGN_RESEARCH_TOOL, "
+        f"{counts.get('SAFE', 0)} SAFE.",
+    ]
+    if counts.get("MALICIOUS"):
+        names = [r.filename for r in file_results if r.final_verdict == "MALICIOUS"]
+        parts.append(f"Malicious file(s): {', '.join(names)}. Quarantine recommended.")
+    elif counts.get("SUSPICIOUS"):
+        parts.append("Suspicious patterns detected. Manual review recommended.")
+    else:
+        parts.append("All files exhibit benign analytical behavior.")
+
+    return archive_verdict, archive_score, " ".join(parts)
+
+
+# =============================================================================
+#  /predict  ENDPOINT
+# =============================================================================
+
+@app.post("/predict", response_model=PredictResponse)
+async def predict(file: UploadFile = File(...)) -> PredictResponse:
+    """Main prediction endpoint - analyzes ZIP uploads for malicious behavior."""
+    raw_bytes = await file.read()
+    filename  = file.filename or "upload"
+
+    if len(raw_bytes) > MAX_ZIP_BYTES:
+        raise HTTPException(413, "Upload too large.")
+
+    log.info("=" * 60)
+    log.info("SCAN  %s  (%d bytes)", filename, len(raw_bytes))
+    log.info("=" * 60)
+
+    # Use zip_scanner for in-memory extraction
+    members = extract_files_from_upload(raw_bytes, filename)
+    
+    # Analyze each file using modular components
+    # NOTE: member_filename is passed to extract_features for research path detection
+    file_results = [analyse_file(mfn, content) for mfn, content in members]
+    
+    # Generate archive summary
+    archive_verdict, archive_score, behavioral_summary = summarise_archive(file_results)
+
+    log.info("ARCHIVE VERDICT: %s  score=%.1f", archive_verdict, archive_score)
+
+    return PredictResponse(
+        archive_verdict    = archive_verdict,
+        archive_risk_score = archive_score,
+        behavioral_summary = behavioral_summary,
+        file_results       = file_results,
+    )
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {"status": "ok", "version": "5.0", "model": OLLAMA_MODEL}
+
+
+@app.get("/")
+async def root():
+    """Root endpoint with service info."""
+    return {
+        "service": "Sentinel v5.0 Behavioral Engine",
+        "model": OLLAMA_MODEL,
+        "ollama_url": OLLAMA_URL,
+        "description": "ZIP-based behavioral analysis with AI judgment",
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print("=" * 60)
+    print(" Sentinel v5.0  —  Behavioral Analysis Endpoint")
+    print(f" Ollama : {OLLAMA_URL}  model={OLLAMA_MODEL}")
+    print("=" * 60)
+    uvicorn.run("predict:app", host="0.0.0.0", port=8000, reload=True)
